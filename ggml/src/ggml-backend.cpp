@@ -27,6 +27,10 @@
 #include <sys/sysctl.h>
 #endif
 
+#ifdef GGML_USE_OPENMP
+#include <omp.h>
+#endif
+
 
 // backend buffer type
 
@@ -2270,7 +2274,23 @@ static bool ggml_backend_cpu_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
 
 static void ggml_backend_cpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     GGML_ASSERT(buffer);
+#ifdef GGML_USE_OPENMP
+    uint8_t * data = (uint8_t *) buffer->context;
+    const size_t size = buffer->size;
+    #pragma omp parallel
+    {
+        const int nth = omp_get_num_threads();
+        const int ith = omp_get_thread_num();
+        const size_t chunk = (size + (size_t) nth - 1) / (size_t) nth;
+        const size_t start = (size_t) ith * chunk;
+        const size_t end   = start + chunk < size ? start + chunk : size;
+        if (start < end) {
+            memset(data + start, value, end - start);
+        }
+    }
+#else
     memset(buffer->context, value, buffer->size);
+#endif
 }
 
 static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_i = {

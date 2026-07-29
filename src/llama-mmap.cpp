@@ -24,6 +24,47 @@
     #endif
 #endif
 
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <linux/mempolicy.h>
+#include <dirent.h>
+#include <cstdio>
+
+// ponytail: experimental — the mmap'd model file's page-cache pages can already be
+// resident (and NUMA-placed) from an earlier, uncontrolled load, long before this
+// process's own NUMA-aware threads ever touch them; first-touch placement then has
+// nothing to place. mbind(..., MPOL_MF_MOVE_ALL) actively migrates already-resident
+// pages to an even interleave across nodes, unlike posix_madvise which only advises
+// future (not-yet-faulted) access patterns.
+static void llama_mmap_numa_interleave(void * addr, size_t len) {
+    unsigned long nodemask = 0;
+    int n_nodes = 0;
+    DIR * d = opendir("/sys/devices/system/node");
+    if (!d) {
+        return;
+    }
+    struct dirent * ent;
+    while ((ent = readdir(d)) != nullptr) {
+        int node_id;
+        if (sscanf(ent->d_name, "node%d", &node_id) == 1 && node_id >= 0 && node_id < 64) {
+            nodemask |= (1UL << node_id);
+            if (node_id + 1 > n_nodes) {
+                n_nodes = node_id + 1;
+            }
+        }
+    }
+    closedir(d);
+    if (n_nodes <= 1) {
+        return;
+    }
+    long ret = syscall(SYS_mbind, addr, len, MPOL_INTERLEAVE, &nodemask,
+                        (unsigned long) (n_nodes + 1), MPOL_MF_MOVE);
+    if (ret != 0) {
+        fprintf(stderr, "warning: mbind(MPOL_INTERLEAVE) failed: %s\n", strerror(errno));
+    }
+}
+#endif
+
 #if defined(_WIN32)
     #define WIN32_LEAN_AND_MEAN
     #ifndef NOMINMAX
@@ -470,6 +511,9 @@ struct llama_mmap::impl {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
                         strerror(errno));
             }
+#if defined(__linux__)
+            llama_mmap_numa_interleave(addr, file->size());
+#endif
         }
 
         mapped_fragments.emplace_back(0, file->size());

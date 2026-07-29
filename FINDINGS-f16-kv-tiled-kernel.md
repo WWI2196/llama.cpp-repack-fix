@@ -114,3 +114,32 @@ class of test, don't trust the arithmetic alone.
 Kept private per standing instruction — this is a config/deployment finding
 specific to this box's memory budget and workload, not a general-purpose
 patch, and isn't intended for the official repo regardless.
+
+## Correction (same day): no capacity tradeoff was actually needed
+
+The "F16 KV needs ~2x q8_0's memory" estimate above was a reasonable
+theoretical guess (2 bytes/element vs q8_0's ~1.06 bytes/element including
+block-quantization overhead) but didn't match reality once measured: the
+deployed single-slot instance used only ~30.5GB total (≈11.5GB KV), not the
+~21.5GB predicted.
+
+Tested 2 full slots (262144 ctx each) with production stopped first (per the
+operational lesson above — never test full-scale configs alongside live
+traffic): **loads cleanly, 41.1GB used, 21GB headroom, both slots
+functionally verified independently, zero swap.**
+
+## Final deployed config (supersedes the single-slot version above)
+
+```
+-c 524288 --parallel 2 --numa distribute -t 32 -tb 32 -fa on --no-mmap -ctk f16 -ctv f16
+```
+
+Full original capacity (2 slots, 262144 context each) with every F16 benefit
+(6.3x prefill, faster decode, better quality) and **zero capacity
+compromise**. The single-slot config was live only briefly while full-scale
+capacity was being verified.
+
+Lesson: don't trust a theoretical bytes-per-element memory estimate over
+direct measurement, even when the theory seems solid — same "measure, don't
+assume" principle this fork's other findings already established for
+KV-quantization sensitivity, now confirmed again for memory sizing.

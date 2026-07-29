@@ -57,11 +57,44 @@ static void llama_mmap_numa_interleave(void * addr, size_t len) {
     if (n_nodes <= 1) {
         return;
     }
+    // MPOL_MF_MOVE_ALL only migrates pages already present in THIS process's own
+    // page table; calling mbind() right after mmap() (before any access) has nothing
+    // to migrate yet even if the page cache already holds the data elsewhere. Touch
+    // every page first so PTEs exist pointing at wherever they currently live, then
+    // mbind has something concrete to move off the wrong node.
+    {
+        volatile uint8_t sink = 0;
+        const uint8_t * p = (const uint8_t *) addr;
+        for (size_t off = 0; off < len; off += 4096) {
+            sink += p[off];
+        }
+        (void) sink;
+    }
+
     long ret = syscall(SYS_mbind, addr, len, MPOL_INTERLEAVE, &nodemask,
-                        (unsigned long) (n_nodes + 1), MPOL_MF_MOVE);
+                        (unsigned long) (n_nodes + 1), MPOL_MF_MOVE | MPOL_MF_MOVE_ALL);
     if (ret != 0) {
         fprintf(stderr, "warning: mbind(MPOL_INTERLEAVE) failed: %s\n", strerror(errno));
+        return;
     }
+
+    // self-verification: /proc/<pid>/numa_maps becomes unreadable by other processes
+    // once this process holds an elevated capability (dumpable flag cleared), so check
+    // actual post-migration placement from inside the process itself via get_mempolicy.
+    long node_count[64] = {0};
+    const size_t stride = 16UL * 1024 * 1024; // sample every 16MB
+    size_t n_samples = 0;
+    for (size_t off = 0; off < len; off += stride) {
+        int node = -1;
+        long r = syscall(SYS_get_mempolicy, &node, nullptr, 0,
+                          (uint8_t *) addr + off, MPOL_F_NODE | MPOL_F_ADDR);
+        if (r == 0 && node >= 0 && node < 64) {
+            node_count[node]++;
+            n_samples++;
+        }
+    }
+    fprintf(stderr, "mbind(MPOL_INTERLEAVE) verify: %zu samples, node0=%ld node1=%ld\n",
+            n_samples, node_count[0], node_count[1]);
 }
 #endif
 

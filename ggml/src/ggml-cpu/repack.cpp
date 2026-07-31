@@ -16,6 +16,10 @@
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
 
+#ifdef GGML_USE_OPENMP
+#include <omp.h>
+#endif
+
 #include "repack.h"
 
 #if defined(__GNUC__)
@@ -3235,7 +3239,6 @@ static int repack_q4_K_to_q4_K_8_bl(struct ggml_tensor * t, int interleave_block
 
     block_q4_Kx8 * dst = (block_q4_Kx8*)t->data;
     const block_q4_K * src = (const block_q4_K*) data;
-    block_q4_K dst_tmp[8];
     int nrow = ggml_nrows(t);
     int nblocks = t->ne[0] / QK_K;
 
@@ -3245,15 +3248,43 @@ static int repack_q4_K_to_q4_K_8_bl(struct ggml_tensor * t, int interleave_block
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i  = 0; i < nrows_interleaved; i++ ) {
-                dst_tmp[i] = src[x + i * nblocks];
+    // Each group of `nrows_interleaved` source rows maps to exactly `nblocks`
+    // destination blocks, at a fixed offset determined by the group index --
+    // groups touch disjoint src/dst ranges, so this loop is safe to run in parallel.
+    const int n_groups = nrow / nrows_interleaved;
+
+#ifdef GGML_USE_OPENMP
+    #pragma omp parallel
+    {
+        ggml_cpu_set_numa_thread_affinity(omp_get_thread_num());
+        #pragma omp for
+        for (int g = 0; g < n_groups; g++) {
+            block_q4_K dst_tmp[8];
+            const block_q4_K * src_group = src + (int64_t) g * nrows_interleaved * nblocks;
+            block_q4_Kx8     * dst_group = dst + (int64_t) g * nblocks;
+
+            for (int64_t x = 0; x < nblocks; x++) {
+                for (int i = 0; i < nrows_interleaved; i++) {
+                    dst_tmp[i] = src_group[x + i * nblocks];
+                }
+                dst_group[x] = make_block_q4_Kx8(dst_tmp, interleave_block);
             }
-            *dst++ = make_block_q4_Kx8(dst_tmp, interleave_block);
         }
-        src += nrows_interleaved * nblocks;
     }
+#else
+    for (int g = 0; g < n_groups; g++) {
+        block_q4_K dst_tmp[8];
+        const block_q4_K * src_group = src + (int64_t) g * nrows_interleaved * nblocks;
+        block_q4_Kx8     * dst_group = dst + (int64_t) g * nblocks;
+
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int i = 0; i < nrows_interleaved; i++) {
+                dst_tmp[i] = src_group[x + i * nblocks];
+            }
+            dst_group[x] = make_block_q4_Kx8(dst_tmp, interleave_block);
+        }
+    }
+#endif
     return 0;
 
     GGML_UNUSED(data_size);
